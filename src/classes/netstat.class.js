@@ -2,13 +2,11 @@ class Netstat {
     constructor(parentId) {
         if (!parentId) throw "Missing parameters";
 
-        this.si = require("systeminformation");
-
         // Create DOM
         this.parent = document.getElementById(parentId);
         this.parent.innerHTML += `<div id="mod_netstat">
             <div id="mod_netstat_inner">
-                <h1>NETWORK STATUS</h1>
+                <h1>NETWORK STATUS<i id="mod_netstat_iname"></i></h1>
                 <div id="mod_netstat_innercontainer">
                     <div>
                         <h1>STATE</h1>
@@ -27,7 +25,10 @@ class Netstat {
         </div>`;
 
         this.offline = false;
-        this.lastconn = {_ended: true};
+        this.lastconn = {finished: false}; // Prevent geoip lookup attempt until maxminddb is loaded
+        this.iface = null;
+        this.failedAttempts = {};
+        this.runsBeforeGeoIPUpdate = 0;
 
         this._httpsAgent = new require("https").Agent({
             keepAlive: false,
@@ -38,77 +39,142 @@ class Netstat {
         this.updateInfo();
         this.infoUpdater = setInterval(() => {
             this.updateInfo();
-        }, 1000);
+        }, 2000);
+
+        // Init GeoIP integrated backend
+        this.geoLookup = {
+            get: () => null
+        };
+        let geolite2 = require("geolite2-redist");
+        let maxmind = require("maxmind");
+        geolite2.open('GeoLite2-City', path => {
+            return maxmind.open(path);
+        }).catch(e => {throw e}).then(lookup => {
+            this.geoLookup = lookup;
+            this.lastconn.finished = true;
+        });
     }
     updateInfo() {
-        this.si.networkInterfaces((data) => {
+        window.si.networkInterfaces().then(async data => {
             let offline = false;
 
-            // Find the first external network networkInterface
             let net = data[0];
             let netID = 0;
-            while (net.internal === true) {
-                netID++;
-                if (data[netID]) {
-                    net = data[netID];
-                } else {
-                    // No external connection!
-                    break;
+
+            if (typeof window.settings.iface === "string") {
+                while (net.iface !== window.settings.iface) {
+                    netID++;
+                    if (data[netID]) {
+                        net = data[netID];
+                    } else {
+                        // No detected interface has the custom iface name, fallback to automatic detection on next loop
+                        window.settings.iface = false;
+                        return false;
+                    }
+                }
+            } else {
+                // Find the first external, IPv4 connected networkInterface that has a MAC address set
+
+                while (net.operstate !== "up" || net.internal === true || net.ip4 === "" || net.mac === "") {
+                    netID++;
+                    if (data[netID]) {
+                        net = data[netID];
+                    } else {
+                        // No external connection!
+                        this.iface = null;
+                        document.getElementById("mod_netstat_iname").innerText = "Interface: (offline)";
+
+                        this.offline = true;
+                        document.querySelector("#mod_netstat_innercontainer > div:first-child > h2").innerHTML = "OFFLINE";
+                        document.querySelector("#mod_netstat_innercontainer > div:nth-child(2) > h2").innerHTML = "--.--.--.--";
+                        document.querySelector("#mod_netstat_innercontainer > div:nth-child(3) > h2").innerHTML = "--ms";
+                        break;
+                    }
                 }
             }
+
+            if (net.ip4 !== this.internalIPv4) this.runsBeforeGeoIPUpdate = 0;
+
+            this.iface = net.iface;
+            this.internalIPv4 = net.ip4;
+            document.getElementById("mod_netstat_iname").innerText = "Interface: "+net.iface;
 
             if (net.ip4 === "127.0.0.1") {
                 offline = true;
             } else {
-                if (this.lastconn._ended) {
-                    this.lastconn = require("https").get({host: "ipinfo.now.sh", port: 443, path: "/", agent: this._httpsAgent}, (res) => {
+                if (this.runsBeforeGeoIPUpdate === 0 && this.lastconn.finished) {
+                    this.lastconn = require("https").get({host: "myexternalip.com", port: 443, path: "/json", localAddress: net.ip4, agent: this._httpsAgent}, res => {
                         let rawData = "";
-                        res.on("data", (chunk) => {
+                        res.on("data", chunk => {
                             rawData += chunk;
                         });
                         res.on("end", () => {
                             try {
-                                this.ipinfo = JSON.parse(rawData);
+                                let data = JSON.parse(rawData);
+                                this.ipinfo = {
+                                    ip: data.ip,
+                                    geo: this.geoLookup.get(data.ip).location
+                                };
 
-                                if (this.ipinfo.api_version !== "2.0.0") console.warn("Warning: ipinfo API version might not be compatible");
-
-                                delete this.ipinfo.api_version;
-                                delete this.ipinfo.time;
                                 let ip = this.ipinfo.ip;
-                                document.querySelector("#mod_netstat_innercontainer > div:nth-child(2) > h2").innerHTML = ip;
+                                document.querySelector("#mod_netstat_innercontainer > div:nth-child(2) > h2").innerHTML = window._escapeHtml(ip);
+
+                                this.runsBeforeGeoIPUpdate = 10;
                             } catch(e) {
+                                this.failedAttempts[e] = (this.failedAttempts[e] || 0) + 1;
+                                if (this.failedAttempts[e] > 2) return false;
                                 console.warn(e);
                                 console.info(rawData.toString());
                                 let electron = require("electron");
-                                electron.ipcRenderer.send("log", "note", "NetStat: Error parsing data from ipinfo.now.sh");
+                                electron.ipcRenderer.send("log", "note", "NetStat: Error parsing data from myexternalip.com");
                                 electron.ipcRenderer.send("log", "debug", `Error: ${e}`);
                             }
                         });
-                    }).on("error", (e) => {
+                    }).on("error", e => {
                         // Drop it
                     });
+                } else if (this.runsBeforeGeoIPUpdate !== 0) {
+                    this.runsBeforeGeoIPUpdate = this.runsBeforeGeoIPUpdate - 1;
                 }
 
-                this.si.inetLatency("1.1.1.1", (data) => {
-                    let ping;
-                    if (data === -1) {
-                        ping = "--ms";
-                        offline = true;
-                    } else {
-                        ping = Math.round(data)+"ms";
-                    }
+                let p = await this.ping(window.settings.pingAddr || "1.1.1.1", 80, net.ip4).catch(() => { offline = true });
 
-                    this.offline = offline;
-                    if (offline) {
-                        document.querySelector("#mod_netstat_innercontainer > div:first-child > h2").innerHTML = "OFFLINE";
-                        document.querySelector("#mod_netstat_innercontainer > div:nth-child(2) > h2").innerHTML = "--.--.--.--";
-                        document.querySelector("#mod_netstat_innercontainer > div:nth-child(3) > h2").innerHTML = "--ms";
-                    } else {
-                        document.querySelector("#mod_netstat_innercontainer > div:first-child > h2").innerHTML = "ONLINE";
-                        document.querySelector("#mod_netstat_innercontainer > div:nth-child(3) > h2").innerHTML = ping;
-                    }
-                });
+                this.offline = offline;
+                if (offline) {
+                    document.querySelector("#mod_netstat_innercontainer > div:first-child > h2").innerHTML = "OFFLINE";
+                    document.querySelector("#mod_netstat_innercontainer > div:nth-child(2) > h2").innerHTML = "--.--.--.--";
+                    document.querySelector("#mod_netstat_innercontainer > div:nth-child(3) > h2").innerHTML = "--ms";
+                } else {
+                    document.querySelector("#mod_netstat_innercontainer > div:first-child > h2").innerHTML = "ONLINE";
+                    document.querySelector("#mod_netstat_innercontainer > div:nth-child(3) > h2").innerHTML = Math.round(p)+"ms";
+                }
             }
+        });
+    }
+    ping(target, port, local) {
+        return new Promise((resolve, reject) => {
+            let s = new require("net").Socket();
+            let start = process.hrtime();
+
+            s.connect({
+                port,
+                host: target,
+                localAddress: local,
+                family: 4
+            }, () => {
+                let time_arr = process.hrtime(start);
+                let time = (time_arr[0] * 1e9 + time_arr[1]) / 1e6;
+                resolve(time);
+                s.destroy();
+            });
+            s.on('error', e => {
+                s.destroy();
+                reject(e);
+            });
+            s.setTimeout(1900, function() {
+                s.destroy();
+                reject(new Error("Socket timeout"));
+            });
         });
     }
 }

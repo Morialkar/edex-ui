@@ -4,16 +4,14 @@ class Terminal {
             if (!opts.parentId) throw "Missing options";
 
             this.xTerm = require("xterm").Terminal;
+            const {AttachAddon} = require("xterm-addon-attach");
+            const {FitAddon} = require("xterm-addon-fit");
+            const {LigaturesAddon} = require("xterm-addon-ligatures");
             this.Ipc = require("electron").ipcRenderer;
 
             this.port = opts.port || 3000;
             this.cwd = "";
             this.oncwdchange = () => {};
-
-            let attachAddon = require("./node_modules/xterm/lib/addons/attach/attach.js");
-            let fitAddon = require("./node_modules/xterm/lib/addons/fit/fit.js");
-            this.xTerm.applyAddon(attachAddon);
-            this.xTerm.applyAddon(fitAddon);
 
             this._sendSizeToServer = () => {
                 let cols = this.term.cols.toString();
@@ -27,10 +25,75 @@ class Terminal {
                 this.Ipc.send("terminal_channel-"+this.port, "Resize", cols, rows);
             };
 
+            // Support for custom color filters on the terminal - see #483
+            let doCustomFilter = (window.isTermFilterValidated) ? true : false;
+
+            // Parse & validate color filter
+            if (window.isTermFilterValidated !== true && typeof window.theme.terminal.colorFilter === "object" && window.theme.terminal.colorFilter.length > 0) {
+                doCustomFilter = window.theme.terminal.colorFilter.every((step, i, a) => {
+                    let func = step.slice(0, step.indexOf("("));
+
+                    switch(func) {
+                        case "negate":
+                        case "grayscale":
+                            a[i] = {
+                                func,
+                                arg: []
+                            };
+                            return true;
+                        case "lighten":
+                        case "darken":
+                        case "saturate":
+                        case "desaturate":
+                        case "whiten":
+                        case "blacken":
+                        case "fade":
+                        case "opaquer":
+                        case "rotate":
+                        case "mix":
+                            break;
+                        default:
+                            return false;
+                    }
+
+                    let arg = step.slice(step.indexOf("(")+1, step.indexOf(")"));
+
+                    if (typeof Number(arg) === "number") {
+                        a[i] = {
+                            func,
+                            arg: [Number(arg)]
+                        };
+                        window.isTermFilterValidated = true;
+                        return true;
+                    }
+
+                    return false;
+                });
+            }
+
             let color = require("color");
-            let colorify = (base, target) => {
-                return color(base).grayscale().mix(color(target), 0.3).hex();
-            };
+            let colorify;
+            if (doCustomFilter) {
+                colorify = (base, target) => {
+                    let newColor = color(base);
+                    target = color(target);
+
+                    for (let i = 0; i < window.theme.terminal.colorFilter.length; i++) {
+                        if (window.theme.terminal.colorFilter[i].func === "mix") {
+                            newColor = newColor[window.theme.terminal.colorFilter[i].func](target, ...window.theme.terminal.colorFilter[i].arg);
+                        } else {
+                            newColor = newColor[window.theme.terminal.colorFilter[i].func](...window.theme.terminal.colorFilter[i].arg);
+                        }
+                    }
+
+                    return newColor.hex();
+                };
+            } else {
+                colorify = (base, target) => {
+                    return color(base).grayscale().mix(color(target), 0.3).hex();
+                };
+            }
+
             let themeColor = `rgb(${window.theme.r}, ${window.theme.g}, ${window.theme.b})`;
 
             this.term = new this.xTerm({
@@ -40,7 +103,7 @@ class Terminal {
                 cursorStyle: window.theme.terminal.cursorStyle || "block",
                 allowTransparency: window.theme.terminal.allowTransparency || false,
                 fontFamily: window.theme.terminal.fontFamily || "Fira Mono",
-                fontSize: window.theme.terminal.fontSize || 15,
+                fontSize: window.theme.terminal.fontSize || window.settings.termFontSize || 15,
                 fontWeight: window.theme.terminal.fontWeight || "normal",
                 fontWeightBold: window.theme.terminal.fontWeightBold || "bold",
                 letterSpacing: window.theme.terminal.letterSpacing || 0,
@@ -71,7 +134,15 @@ class Terminal {
                     brightWhite: window.theme.colors.brightWhite || colorify("#eeeeec", themeColor)
                 }
             });
+            let fitAddon = new FitAddon();
+            this.term.loadAddon(fitAddon);
             this.term.open(document.getElementById(opts.parentId));
+            let ligaturesAddon = new LigaturesAddon();
+            this.term.loadAddon(ligaturesAddon);
+            this.term.attachCustomKeyEventHandler(e => {
+                window.keyboard.keydownHandler(e);
+                return true;
+            });
             this.term.focus();
 
             this.Ipc.send("terminal_channel-"+this.port, "Renderer startup");
@@ -85,30 +156,57 @@ class Terminal {
                         this.cwd = "FALLBACK |-- "+args[1];
                         this.oncwdchange(this.cwd);
                         break;
+                    case "New process":
+                        if (this.onprocesschange) {
+                            this.onprocesschange(args[1]);
+                        }
+                        break;
                     default:
                         return;
                 }
             });
+            this.resendCWD = () => {
+                this.oncwdchange(this.cwd || null);
+            };
 
             let sockHost = opts.host || "127.0.0.1";
             let sockPort = this.port;
 
             this.socket = new WebSocket("ws://"+sockHost+":"+sockPort);
             this.socket.onopen = () => {
-                this.term.attach(this.socket);
+                let attachAddon = new AttachAddon(this.socket);
+                this.term.loadAddon(attachAddon);
                 this.fit();
-                setTimeout(() => {
-                    this.fit();
-                    if (process.platform === "win32") {
-                        // Force Powershell to print a prompt
-                        setTimeout(() => {
-                            this.write("n");
-                            this.write("\b");
-                        }, 1000);
-                    }
-                }, 200);
             };
-            this.socket.onerror = (e) => {throw JSON.stringify(e)};
+            this.socket.onerror = e => {throw JSON.stringify(e)};
+            this.socket.onclose = e => {
+                if (this.onclose) {
+                    this.onclose(e);
+                }
+            };
+
+            this.lastSoundFX = Date.now();
+            this.socket.addEventListener("message", e => {
+                let d = Date.now();
+
+                if (d - this.lastSoundFX > 30) {
+                    window.audioManager.stdout.play();
+                    this.lastSoundFX = d;
+                }
+                if (d - this.lastRefit > 10000) {
+                    this.fit();
+                }
+
+                // See #397
+                if (!window.settings.experimentalGlobeFeatures) return;
+                let ips = e.data.match(/((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)/g);
+                if (ips !== null && ips.length >= 1) {
+                    ips = ips.filter((val, index, self) => { return self.indexOf(val) === index; });
+                    ips.forEach(ip => {
+                        window.mods.globe.addTemporaryConnectedMarker(ip);
+                    });
+                }
+            });
 
             let parent = document.getElementById(opts.parentId);
             parent.addEventListener("wheel", e => {
@@ -136,21 +234,37 @@ class Terminal {
             document.querySelector(".xterm-helper-textarea").addEventListener("keydown", e => {
                 if (e.key === "F11" && window.settings.allowWindowed) {
                     e.preventDefault();
-                    let win = require("electron").remote.BrowserWindow.getFocusedWindow();
-                    let bool = (win.isFullScreen() ? false : true);
-                    win.setFullScreen(bool);
-
-                    setTimeout(() => {
-                        this.fit();
-                    }, 700);
+                    window.toggleFullScreen();
                 }
             });
 
             this.fit = () => {
-                this.term.fit();
-                setTimeout(() => {
-                    this.resize(this.term.cols+1, this.term.rows);
-                }, 50);
+                this.lastRefit = Date.now();
+                let {cols, rows} = fitAddon.proposeDimensions();
+
+                // Apply custom fixes based on screen ratio, see #302
+                let w = screen.width;
+                let h = screen.height;
+                let x = 1;
+                let y = 0;
+
+                function gcd(a, b) {
+                    return (b == 0) ? a : gcd(b, a%b);
+                }
+                let d = gcd(w, h);
+
+                if (d === 100) { y = 1; x = 3;}
+                // if (d === 120) y = 1;
+                if (d === 256) x = 2;
+
+                if (window.settings.termFontSize < 15) y = y - 1;
+
+                cols = cols+x;
+                rows = rows+y;
+
+                if (this.term.cols !== cols || this.term.rows !== rows) {
+                    this.resize(cols, rows);
+                }
             };
 
             this.resize = (cols, rows) => {
@@ -174,11 +288,8 @@ class Terminal {
                     this.clipboard.didCopy = true;
                 },
                 paste: () => {
-                    this.Ipc.once("clipboard-reply", (e, txt) => {
-                        this.write(txt);
-                        this.clipboard.didCopy = false;
-                    });
-                    this.Ipc.send("clipboard", "read");
+                    this.write(electron.remote.clipboard.readText());
+                    this.clipboard.didCopy = false;
                 },
                 didCopy: false
             };
@@ -192,13 +303,14 @@ class Terminal {
             this.renderer = null;
             this.port = opts.port || 3000;
 
+            this._closed = false;
             this.onclosed = () => {};
             this.onopened = () => {};
             this.onresize = () => {};
             this.ondisconnected = () => {};
 
             this._disableCWDtracking = false;
-            this._getTtyCWD = (tty) => {
+            this._getTtyCWD = tty => {
                 return new Promise((resolve, reject) => {
                     let pid = tty._pid;
                     switch(require("os").type()) {
@@ -212,11 +324,7 @@ class Terminal {
                             });
                             break;
                         case "Darwin":
-                            // OK, the following is quite of a hacky solution
-                            // Each $XX after the $9 in the awk commands provide support for one more space
-                            // character in the path (otherwise it just gets cut)
-                            // There's probably a better way to do this, PRs welcome
-                            require("child_process").exec(`lsof -a -d cwd -p ${pid} | tail -1 | awk '{print $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20}'`, (e, cwd) => {
+                            require("child_process").exec(`lsof -a -d cwd -p ${pid} | tail -1 | awk '{ for (i=9; i<=NF; i++) printf "%s ", $i }'`, (e, cwd) => {
                                 if (e !== null) {
                                     reject(e);
                                 } else {
@@ -229,7 +337,27 @@ class Terminal {
                     }
                 });
             };
+            this._getTtyProcess = tty => {
+                return new Promise((resolve, reject) => {
+                    let pid = tty._pid;
+                    switch(require("os").type()) {
+                        case "Linux":
+                        case "Darwin":
+                            require("child_process").exec(`ps -o comm --no-headers --sort=+pid -g ${pid} | tail -1`, (e, proc) => {
+                                if (e !== null) {
+                                    reject(e);
+                                } else {
+                                    resolve(proc.trim());
+                                }
+                            });
+                            break;
+                        default:
+                            reject("Unsupported OS");
+                    }
+                });
+            };
             this._nextTickUpdateTtyCWD = false;
+            this._nextTickUpdateProcess = false;
             this._tick = setInterval(() => {
                 if (this._nextTickUpdateTtyCWD && this._disableCWDtracking === false) {
                     this._nextTickUpdateTtyCWD = false;
@@ -240,31 +368,56 @@ class Terminal {
                             this.renderer.send("terminal_channel-"+this.port, "New cwd", cwd);
                         }
                     }).catch(e => {
-                        console.log("Error while tracking TTY working directory: ", e);
-                        this._disableCWDtracking = true;
+                        if (!this._closed) {
+                            console.log("Error while tracking TTY working directory: ", e);
+                            this._disableCWDtracking = true;
+                            try {
+                                this.renderer.send("terminal_channel-"+this.port, "Fallback cwd", opts.cwd || process.env.PWD);
+                            } catch(e) {
+                                // renderer closed
+                            }
+                        }
+                    });
+                }
+
+                if (this.renderer && this._nextTickUpdateProcess) {
+                    this._nextTickUpdateProcess = false;
+                    this._getTtyProcess(this.tty).then(process => {
+                        if (this.tty._process === process) return;
+                        this.tty._process = process;
                         if (this.renderer) {
-                            this.renderer.send("terminal_channel-"+this.port, "Fallback cwd", opts.cwd || process.env.PWD);
+                            this.renderer.send("terminal_channel-"+this.port, "New process", process);
+                        }
+                    }).catch(e => {
+                        if (!this._closed) {
+                            console.log("Error while retrieving TTY subprocess: ", e);
+                            try {
+                                this.renderer.send("terminal_channel-"+this.port, "New process", "");
+                            } catch(e) {
+                                // renderer closed
+                            }
                         }
                     });
                 }
             }, 1000);
 
-            this.tty = this.Pty.spawn(opts.shell || "bash", [], {
-                name: "xterm-color",
+            this.tty = this.Pty.spawn(opts.shell || "bash", (opts.params.length > 0 ? opts.params : (process.platform === "win32" ? [] : ["--login"])), {
+                name: opts.env.TERM || "xterm-256color",
                 cols: 80,
                 rows: 24,
                 cwd: opts.cwd || process.env.PWD,
-                env: process.env
+                env: opts.env || process.env
             });
 
-            this.tty.on("exit", (code, signal) => {
+            this.tty.onExit((code, signal) => {
+                this._closed = true;
                 this.onclosed(code, signal);
             });
 
             this.wss = new this.Websocket({
                 port: this.port,
                 clientTracking: true,
-                verifyClient: (info) => {
+                verifyClient: info => {
                     if (this.wss.clients.length >= 1) {
                         return false;
                     } else {
@@ -293,16 +446,17 @@ class Terminal {
                         return;
                 }
             });
-            this.wss.on("connection", (ws) => {
-                this.onopened();
+            this.wss.on("connection", ws => {
+                this.onopened(this.tty._pid);
                 ws.on("close", (code, reason) => {
                     this.ondisconnected(code, reason);
                 });
-                ws.on("message", (msg) => {
+                ws.on("message", msg => {
                     this.tty.write(msg);
                 });
-                this.tty.on("data", (data) => {
+                this.tty.onData(data => {
                     this._nextTickUpdateTtyCWD = true;
+                    this._nextTickUpdateProcess = true;
                     try {
                         ws.send(data);
                     } catch (e) {
@@ -310,6 +464,11 @@ class Terminal {
                     }
                 });
             });
+
+            this.close = () => {
+                this.tty.kill();
+                this._closed = true;
+            };
         } else {
             throw "Unknown purpose";
         }

@@ -2,8 +2,6 @@ class Cpuinfo {
     constructor(parentId) {
         if (!parentId) throw "Missing parameters";
 
-        this.si = require("systeminformation");
-
         // Create initial DOM
         this.parent = document.getElementById(parentId);
         this.parent.innerHTML += `<div id="mod_cpuinfo">
@@ -16,13 +14,17 @@ class Cpuinfo {
 
         this.series = [];
         this.charts = [];
-        this.si.cpu((data) => {
+        window.si.cpu().then(data => {
             let divide = Math.floor(data.cores/2);
             this.divide = divide;
 
+            let cpuName = data.manufacturer+data.brand;
+            cpuName = cpuName.substr(0, 30);
+            cpuName.substr(0, Math.min(cpuName.length, cpuName.lastIndexOf(" ")));
+
             let innercontainer = document.createElement("div");
             innercontainer.setAttribute("id", "mod_cpuinfo_innercontainer");
-            innercontainer.innerHTML = `<h1>CPU USAGE<i>${data.manufacturer} ${data.brand}</i></h1>
+            innercontainer.innerHTML = `<h1>CPU USAGE<i>${cpuName}</i></h1>
                 <div>
                     <h1># <em>1</em> - <em>${divide}</em><br>
                     <i id="mod_cpuinfo_usagecounter0">Avg. --%</i></h1>
@@ -35,8 +37,8 @@ class Cpuinfo {
                 </div>
                 <div>
                     <div>
-                        <h1>TEMP<br>
-                        <i id="mod_cpuinfo_temp">--°C</i></h1>
+                        <h1>${(process.platform === "win32") ? "CORES" : "TEMP"}<br>
+                        <i id="mod_cpuinfo_temp">${(process.platform === "win32") ? data.cores : "--°C"}</i></h1>
                     </div>
                     <div>
                         <h1>MIN<br>
@@ -96,15 +98,17 @@ class Cpuinfo {
 
             // Init updater
             this.updateCPUload();
-            this.updateCPUtemp();
+            if (process.platform !== "win32") {this.updateCPUtemp();}
             this.updateCPUspeed();
             this.updateCPUtasks();
             this.loadUpdater = setInterval(() => {
                 this.updateCPUload();
             }, 500);
-            this.tempUpdater = setInterval(() => {
-                this.updateCPUtemp();
-            }, 2000);
+            if (process.platform !== "win32") {
+                this.tempUpdater = setInterval(() => {
+                    this.updateCPUtemp();
+                }, 2000);
+            }
             this.speedUpdater = setInterval(() => {
                 this.updateCPUspeed();
             }, 1000);
@@ -114,11 +118,11 @@ class Cpuinfo {
         });
     }
     updateCPUload() {
-        this.si.currentLoad((data) => {
+        window.si.currentLoad().then(data => {
             let average = [[], []];
 
             if (!data.cpus) return; // Prevent memleak in rare case where systeminformation takes extra time to retrieve CPU info (see github issue #216)
-            
+
             data.cpus.forEach((e, i) => {
                 this.series[i].append(new Date().getTime(), e.load);
 
@@ -140,16 +144,16 @@ class Cpuinfo {
         });
     }
     updateCPUtemp() {
-        this.si.cpuTemperature((data) => {
+        window.si.cpuTemperature().then(data => {
             try {
-                document.getElementById("mod_cpuinfo_temp").innerText = `${data.main}°C`;
+                document.getElementById("mod_cpuinfo_temp").innerText = `${data.max}°C`;
             } catch(e) {
                 // See above notice
             }
         });
     }
     updateCPUspeed() {
-        this.si.cpuCurrentspeed((data) => {
+        window.si.cpuCurrentspeed().then(data => {
             try {
                 document.getElementById("mod_cpuinfo_speed_min").innerText = `${data.min}GHz`;
                 document.getElementById("mod_cpuinfo_speed_max").innerText = `${data.max}GHz`;
@@ -159,7 +163,7 @@ class Cpuinfo {
         });
     }
     updateCPUtasks() {
-        this.si.processes((data) => {
+        window.si.processes().then(data => {
             try {
                 document.getElementById("mod_cpuinfo_tasks").innerText = `${data.all}`;
             } catch(e) {

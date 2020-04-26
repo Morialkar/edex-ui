@@ -2,9 +2,14 @@ section#keyboard {
     display: flex;
     flex-direction: column;
     align-items: center;
-    width: 56vw;
+    width: 55.5vw;
     position: relative;
     top: -0.925vh;
+}
+
+section#keyboard[data-password-mode="true"] {
+    opacity: 0.5 !important;
+    cursor: none !important;
 }
 
 div.keyboard_row {
@@ -65,12 +70,12 @@ div.keyboard_key {
     cursor: pointer;
 }
 
-div.keyboard_key:active, div.keyboard_key.active {
+section#keyboard:not([data-password-mode="true"]) div.keyboard_key:active, section#keyboard:not([data-password-mode="true"]) div.keyboard_key.active {
     border: 0.18vh solid rgba(var(--color_r), var(--color_g), var(--color_b), 0.0);
     background-color: rgba(var(--color_r), var(--color_g), var(--color_b), 1);
 }
 
-div.keyboard_key.blink {
+section#keyboard:not([data-password-mode="true"]) div.keyboard_key.blink {
     animation-name: blink;
     animation-duration: .5s;
     animation-iteration-count: infinite;
@@ -102,6 +107,14 @@ div.keyboard_row:not(:nth-child(4)) > .keyboard_key:last-child > *, div.keyboard
 
 div.keyboard_row:last-child > .keyboard_key:nth-last-child(-n+3) > * {
     font-size: 2.4vh;
+}
+
+div.keyboard_key > svg {
+    width: calc(100% - 1vh);
+    height: calc(100% - 1vh);
+    top: .5vh !important;
+    opacity: 1 !important;
+    fill: rgb(var(--color_r), var(--color_g), var(--color_b));
 }
 
 div.keyboard_key > *:not(h1) {

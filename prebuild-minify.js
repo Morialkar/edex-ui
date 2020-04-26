@@ -1,22 +1,26 @@
 const fs = require("fs");
 const path = require("path");
+const stdout = process.stdout;
 const UglifyJS = require("uglify-es");
 const CleanCSS = require("clean-css");
 JSON.minify = require("node-json-minify");
 
-const writeMinified = (path, data) => {
-    fs.writeFile(path, data, (err) => {
-        if (err) {
-            console.log(path+" -  ❌");
-            console.log("");
-            console.log("");
-            throw err;
-        }
-        console.log(path+" -  ✓");
+function writeMinified(path, data) {
+    return new Promise((res, rej) => {
+        fs.writeFile(path, data, (err) => {
+            if (err) {
+                stdout.write(" -  ❌\n\n\n", () => {
+                    rej(err);
+                });
+            }
+            stdout.write(" -  ✓\n", () => {
+                res();
+            });
+        });
     });
-};
+}
 
-const recursiveMinify = (dirPath) => {
+async function recursiveMinify(dirPath) {
     try { var files = fs.readdirSync(dirPath); }
     catch(e) { return; }
     if (files.length > 0) {
@@ -24,8 +28,11 @@ const recursiveMinify = (dirPath) => {
             let filePath = dirPath + '/' + files[i];
             if (fs.statSync(filePath).isFile()) {
 
-                // Grid.json is a massive file that's already pre-minified. Do not process.
-                if (filePath.endsWith("grid.json")) return;
+                // Do not process grid.json because it's heavy and pre-minified, and themes and keyboard files to leave them in a human-readable state
+                if (filePath.endsWith(".json") && !filePath.endsWith("icons.json")) return;
+                // See #446
+                if (filePath.endsWith("file-icons-match.js")) return;
+                await stdout.write(filePath.slice(filePath.indexOf('prebuild-src/')+13)+'...');
 
                 switch (filePath.split(".").pop()) {
                     case "js":
@@ -41,42 +48,45 @@ const recursiveMinify = (dirPath) => {
                             }
                         });
                         if (!minified.error) {
-                            writeMinified(filePath, minified.code);
-                            break;
-                        }
-                        else {
-                            console.log(filePath+" -  ❌");
-                            console.log("");
-                            console.log("");
+                            await writeMinified(filePath, minified.code).catch(e => {
+                                throw e;
+                            });
+                        } else {
+                            stdout.write(" -  ❌\n\n\n");
                             throw minified.error;
                         }
+                        break;
                     case "css":
                         let output = new CleanCSS({level:2}).minify(fs.readFileSync(filePath, {encoding:"utf-8"}));
                         if (output.errors.length >= 1) {
-                            console.log(filePath+" -  ❌");
-                            console.log("");
-                            console.log("");
+                            stdout.write(" -  ❌\n\n\n");
                             throw output.errors;
                         } else {
-                            writeMinified(filePath, output.styles);
-                            break;
+                            await writeMinified(filePath, output.styles).catch(e => {
+                                throw e;
+                            });
                         }
+                        break;
                     case "json":
+                        let out;
                         try {
-                            writeMinified(filePath, JSON.minify(fs.readFileSync(filePath, {encoding:"utf-8"})));
-                            break;
+                            out = JSON.minify(fs.readFileSync(filePath, {encoding:"utf-8"}));
                         } catch(err) {
-                            console.log(filePath+" -  ❌");
-                            console.log("");
-                            console.log("");
+                            stdout.write(" -  ❌\n\n\n");
                             throw err;
                         }
+                        await writeMinified(filePath, out).catch(e => {
+                            throw e;
+                        });
+                        break;
+                    default:
+                        stdout.write("\n");
                 }
             } else {
-                recursiveMinify(filePath);
+                await recursiveMinify(filePath);
             }
         }
     }
-};
+}
 
 recursiveMinify(path.join(__dirname, "prebuild-src"));
